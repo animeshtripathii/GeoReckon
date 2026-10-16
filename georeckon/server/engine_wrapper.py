@@ -18,6 +18,7 @@ from georeckon.src.virtual_alignment import VirtualInVehicleAligner
 from georeckon.src.vibration_filter import KinematicVibrationFilter
 from georeckon.src.kinematics_speed_estimator import KinematicSpeedEstimator
 from georeckon.src.filter_inekf import InEKF, InEKFState, so3_exp
+from georeckon.src.map_matcher import TopologicalMapMatcher
 
 from georeckon.server.kinonet_r2 import KinoNetR2
 from georeckon.server.geodesics import latlon_to_enu, enu_to_latlon, EARTH_RADIUS_M
@@ -35,6 +36,7 @@ from georeckon.server.models import (
 EARTH_RADIUS_M = 6371000.0
 ALIGN_MIN_HEALTH = 0.25
 _GLOBAL_KINONET_LOCK = threading.Lock()
+_CACHED_KINONET: Optional[KinoNetR2] = None
 
 
 class GeoReckonError(Exception):
@@ -50,32 +52,37 @@ class GeoReckonEngine:
         Initializes the GeoReckon core engine and loads KinoNet-R2 weights.
         Fails cleanly if weights are missing.
         """
-        if weights_path is None:
-            env_path = os.environ.get("KINONET_WEIGHTS")
-            if env_path:
-                weights_path = env_path
-            else:
-                default_p = Path(__file__).resolve().parent.parent.parent / "InertiaX" / "kinonet_r2_best.pth"
-                weights_path = str(default_p)
+        global _CACHED_KINONET
+        if _CACHED_KINONET is None:
+            if weights_path is None:
+                env_path = os.environ.get("KINONET_WEIGHTS")
+                if env_path:
+                    weights_path = env_path
+                else:
+                    default_p = Path(__file__).resolve().parent.parent.parent / "InertiaX" / "kinonet_r2_best.pth"
+                    weights_path = str(default_p)
 
-        self.weights_path = Path(weights_path)
-        if not self.weights_path.exists():
-            raise FileNotFoundError(
-                f"KinoNet weights file not found at: '{self.weights_path}'. "
-                f"Ensure KINONET_WEIGHTS environment variable is set or weights file exists."
-            )
+            self.weights_path = Path(weights_path)
+            if not self.weights_path.exists():
+                raise FileNotFoundError(
+                    f"KinoNet weights file not found at: '{self.weights_path}'. "
+                    f"Ensure KINONET_WEIGHTS environment variable is set or weights file exists."
+                )
 
-        print(f"[GeoReckon] KINONET_WEIGHTS resolved to: '{self.weights_path}' (exists=True)")
+            print(f"[GeoReckon] KINONET_WEIGHTS resolved to: '{self.weights_path}' (exists=True)")
 
-        # Load KinoNetR2 in shadow mode (evaluation only)
-        self.kinonet = KinoNetR2()
-        state_dict = torch.load(str(self.weights_path), map_location="cpu")
-        self.kinonet.load_state_dict(state_dict, strict=True)
-        self.kinonet.eval()
-        # Warm up PyTorch runtime with a dummy forward pass to prime C++ kernels and memory arenas
-        dummy_tensor = torch.zeros((1, 6, 20), dtype=torch.float32)
-        _ = self.kinonet.predict_with_uncertainty(dummy_tensor, n_mc_samples=5)
-        print(f"[GeoReckon] KinoNetR2 loaded with strict=True, shadow mode active (warmed up).")
+            # Load KinoNetR2 in shadow mode (evaluation only)
+            kino = KinoNetR2()
+            state_dict = torch.load(str(self.weights_path), map_location="cpu")
+            kino.load_state_dict(state_dict, strict=True)
+            kino.eval()
+            # Warm up PyTorch runtime with a dummy forward pass to prime C++ kernels and memory arenas
+            dummy_tensor = torch.zeros((1, 6, 20), dtype=torch.float32)
+            _ = kino.predict_with_uncertainty(dummy_tensor, n_mc_samples=5)
+            print(f"[GeoReckon] KinoNetR2 loaded with strict=True, shadow mode active (warmed up).")
+            _CACHED_KINONET = kino
+
+        self.kinonet = _CACHED_KINONET
 
         # Session state
         self.mode = "IDLE"
@@ -101,6 +108,9 @@ class GeoReckonEngine:
         self.vib_filter: Optional[KinematicVibrationFilter] = None
         self.speed_estimator: Optional[KinematicSpeedEstimator] = None
         self.inekf: Optional[InEKF] = None
+        self.adaptive_yaw_bias: float = 0.0
+        self.enable_ai_imu: bool = True
+        self.map_matcher: TopologicalMapMatcher = TopologicalMapMatcher(road_width=7.0, max_snap_distance=35.0)
 
         # Planar Integrator State
         self.pos_enu: np.ndarray = np.zeros(2) # [x_east, y_north]
@@ -220,6 +230,7 @@ class GeoReckonEngine:
         self.fwd_bias = fwd_bias
         self.gyro_bias = gyro_bias
         self.alignment_health = float(health)
+        self.adaptive_yaw_bias = 0.0
 
         # Vibration filter seeded with history
         self.vib_filter = KinematicVibrationFilter(sampling_rate=req.sample_rate_hz, cutoff_hz=1.5)
@@ -268,6 +279,12 @@ class GeoReckonEngine:
             a_veh[0] -= fwd_bias
             w_veh = R_b_to_v @ (w_sample - gyro_bias)
             self.kinonet_buffer.append(np.concatenate([a_veh, w_veh]))
+
+        # Load optional road polyline corridor
+        if req.road_polyline and len(req.road_polyline) >= 2:
+            self.map_matcher.load_polyline(np.array(req.road_polyline, dtype=np.float64))
+        else:
+            self.map_matcher.segments = []
 
         # State transitions
         self.mode = "DEAD_RECKONING"
@@ -403,42 +420,78 @@ class GeoReckonEngine:
         lin_veh = self.R_b_to_v @ lin_phone
         w_veh = self.R_b_to_v @ clean_w
 
+        # AI-IMU dynamic gyro bias tracking:
+        # On straight segments (low lateral accel & small turn rate),
+        # gently adapt residual yaw gyro bias to eliminate cumulative heading drift
+        if self.enable_ai_imu:
+            if abs(lin_veh[1]) < 0.15 and abs(w_veh[2]) < 0.05:
+                self.adaptive_yaw_bias = 0.98 * self.adaptive_yaw_bias + 0.02 * w_veh[2]
+            eff_yaw_rate = float(w_veh[2] - self.adaptive_yaw_bias)
+        else:
+            eff_yaw_rate = float(w_veh[2])
+
         if step_integration and int_dt > 0.001:
             clean_a_win = np.array(self.vib_filter.accel_buffer)
             clean_w_win = np.array(self.vib_filter.gyro_buffer)
             cur_speed, is_stopped = self.speed_estimator.estimate_step(
                 forward_accel=lin_veh[0],
                 lateral_accel=lin_veh[1],
-                yaw_rate=w_veh[2],
+                yaw_rate=eff_yaw_rate,
                 accel_window=clean_a_win[-10:],
                 gyro_window=clean_w_win[-10:],
                 dt=int_dt
             )
+
+            # AI-IMU Centripetal speed cross-validation during significant turns: v = |a_lat / w_z|
+            if self.enable_ai_imu and abs(eff_yaw_rate) > 0.08:
+                v_centripetal = abs(lin_veh[1] / eff_yaw_rate)
+                if 2.0 < v_centripetal < 35.0:
+                    cur_speed = 0.85 * cur_speed + 0.15 * v_centripetal
+
             self.cur_speed_mps = float(cur_speed)
 
             # 3. Planar Kinematic Integrator (evaluator.py:146-150)
-            self.heading_rad += w_veh[2] * int_dt
+            self.heading_rad += eff_yaw_rate * int_dt
             self.pos_enu[0] += self.cur_speed_mps * np.cos(self.heading_rad) * int_dt
             self.pos_enu[1] += self.cur_speed_mps * np.sin(self.heading_rad) * int_dt
             self.dr_distance_m += self.cur_speed_mps * int_dt
         else:
             is_stopped = self.speed_estimator.is_stationary
 
-        # Geodesic conversion (Spherical R = 6371000.0)
-        curr_lat, curr_lon = enu_to_latlon(self.pos_enu[0], self.pos_enu[1], self.lat0, self.lon0)
-        bearing_deg = float((90.0 - np.rad2deg(self.heading_rad)) % 360.0)
-
         # 4. Secondary InEKF (Covariance & comparison)
         if step_integration and int_dt > 0.001 and int_dt < 1.0:
             self.inekf.predict(raw_a, clean_w, int_dt)
+            # AI-IMU MesNet dynamic covariance adaptation:
+            # During turns, relax lateral velocity constraint to account for tire slip angle
+            if self.enable_ai_imu:
+                sigma_lat_sq = float((0.05 + 0.02 * abs(lin_veh[1]) + 0.01 * abs(eff_yaw_rate)) ** 2)
+            else:
+                sigma_lat_sq = 0.05**2
+
             self.inekf.update_chassis_velocity(
                 np.array([self.cur_speed_mps, 0.0, 0.0]),
                 self.R_b_to_v,
-                np.array([0.25**2, 0.05**2, 0.05**2]),
+                np.array([0.25**2, sigma_lat_sq, 0.05**2]),
                 axes=(0, 1, 2)
             )
             if is_stopped:
                 self.inekf.update_zupt(variance=0.01)
+
+            # AI-IMU Lie-group state fusion into pos_enu
+            if self.enable_ai_imu and not self.degraded:
+                inekf_p2d = self.inekf.state.p[:2]
+                if np.all(np.isfinite(inekf_p2d)) and np.linalg.norm(inekf_p2d - self.pos_enu) < 150.0:
+                    self.pos_enu = 0.5 * self.pos_enu + 0.5 * inekf_p2d
+
+        # Road corridor manifold constraint
+        if self.map_matcher and self.map_matcher.segments:
+            self.pos_enu, self.heading_rad = self.map_matcher.constrain_to_road(
+                self.pos_enu, self.heading_rad
+            )
+
+        # Geodesic conversion (Spherical R = 6371000.0)
+        curr_lat, curr_lon = enu_to_latlon(self.pos_enu[0], self.pos_enu[1], self.lat0, self.lon0)
+        bearing_deg = float((90.0 - np.rad2deg(self.heading_rad)) % 360.0)
 
         cov_2d = self.inekf.get_position_covariance_2d()
         inekf_e_m = float(self.inekf.state.p[0])
@@ -468,6 +521,11 @@ class GeoReckonEngine:
                     mean_spd, al_var, ep_var = self.kinonet.predict_with_uncertainty(kino_tensor, n_mc_samples=5)
                 kinonet_speed_mps = float(mean_spd.item())
                 kinonet_var = float((al_var + ep_var).item())
+                # KinoNet active speed fusion: when neural model has high confidence (low variance),
+                # gently anchor forward speed to prevent velocity divergence
+                if self.enable_ai_imu and kinonet_var < 4.0 and kinonet_speed_mps > 1.0 and abs(kinonet_speed_mps - self.cur_speed_mps) < 6.0:
+                    w_k = float(np.clip(0.4 / (1.0 + kinonet_var), 0.05, 0.20))
+                    self.cur_speed_mps = float((1.0 - w_k) * self.cur_speed_mps + w_k * kinonet_speed_mps)
             except Exception:
                 pass
 

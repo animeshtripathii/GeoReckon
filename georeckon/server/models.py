@@ -104,6 +104,8 @@ class CalibrateRequest:
     gps_history: List[GPSHistorySample]
     imu_history: List[IMUHistorySample]
 
+    road_polyline: Optional[List[List[float]]] = None
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "CalibrateRequest":
         if not isinstance(data, dict):
@@ -132,6 +134,8 @@ class CalibrateRequest:
             raise ValueError("Field 'imu_history' must be a list")
         imu_history = [IMUHistorySample.from_dict(im) for im in imu_hist_raw]
 
+        road_polyline = data.get("road_polyline")
+
         return cls(
             session_id=session_id,
             seq=seq,
@@ -141,6 +145,7 @@ class CalibrateRequest:
             last_gps=last_gps,
             gps_history=gps_history,
             imu_history=imu_history,
+            road_polyline=road_polyline,
         )
 
 
